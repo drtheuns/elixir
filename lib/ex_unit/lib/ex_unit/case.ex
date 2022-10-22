@@ -308,10 +308,10 @@ defmodule ExUnit.Case do
       Enum.each(attributes, fn {k, v} -> Module.put_attribute(module, k, v) end)
     end
 
-    async? = opts[:async]
+    async = opts[:async]
 
-    if is_boolean(async?) do
-      Module.put_attribute(module, :ex_unit_async, async?)
+    if async in [true, false, :per_module, :per_test] do
+      Module.put_attribute(module, :ex_unit_async, async)
     end
 
     registered?
@@ -494,8 +494,8 @@ defmodule ExUnit.Case do
                   "please call ExUnit.start() or explicitly start the :ex_unit app"
         end
 
-      Module.get_attribute(module, :ex_unit_async) ->
-        ExUnit.Server.add_async_module(module)
+      type = Module.get_attribute(module, :ex_unit_async) ->
+        ExUnit.Server.add_async_module(module, type)
 
       true ->
         ExUnit.Server.add_sync_module(module)

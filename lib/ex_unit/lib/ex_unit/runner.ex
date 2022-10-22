@@ -101,6 +101,10 @@ defmodule ExUnit.Runner do
         running = wait_until_available(config, running)
         async_loop(config, running, async_once?)
 
+      tests = ExUnit.Server.take_running_tests(available) ->
+        running = execute_running_tests(tests, running)
+        async_loop(config, running, async_once?)
+
       # Slots are available, start with async modules
       modules = ExUnit.Server.take_async_modules(available) ->
         running = spawn_modules(config, modules, running)
@@ -164,6 +168,16 @@ defmodule ExUnit.Runner do
     end
   end
 
+  defp execute_running_tests([], running) do
+    running
+  end
+
+  defp execute_running_tests([{ref, pid} | tests], running) do
+    # See `run_async_tests`
+    send(pid, {:execute, ref})
+    execute_running_tests(tests, Map.put(running, ref, pid))
+  end
+
   ## Stacktrace
 
   # Assertions can pop-up in the middle of the stack
@@ -211,7 +225,10 @@ defmodule ExUnit.Runner do
 
   ## Running modules
 
-  defp run_module(config, module) do
+  defp run_module(config, module) when is_atom(module),
+    do: run_module(config, {module, :per_module})
+
+  defp run_module(config, {module, async_type}) do
     test_module = module.__ex_unit__()
     EM.module_started(config.manager, test_module)
 
@@ -224,7 +241,8 @@ defmodule ExUnit.Runner do
       EM.test_finished(config.manager, excluded_or_skipped_test)
     end
 
-    {test_module, invalid_tests, finished_tests} = run_module(config, test_module, to_run_tests)
+    {test_module, invalid_tests, finished_tests} =
+      run_module(config, test_module, to_run_tests, async_type)
 
     pending_tests =
       case process_max_failures(config, test_module) do
@@ -271,18 +289,26 @@ defmodule ExUnit.Runner do
     test_ids == nil or MapSet.member?(test_ids, {test.module, test.name})
   end
 
-  defp run_module(_config, test_module, []) do
+  defp run_module(_config, test_module, [], _async_type) do
     {test_module, [], []}
   end
 
-  defp run_module(config, test_module, tests) do
+  defp run_module(config, test_module, tests, async_type) do
     {module_pid, module_ref} = run_setup_all(test_module, self())
 
     {test_module, invalid_tests, finished_tests} =
       receive do
         {^module_pid, :setup_all, {:ok, context}} ->
           finished_tests =
-            if max_failures_reached?(config), do: [], else: run_tests(config, tests, context)
+            case async_type do
+              :per_test ->
+                run_async_tests(config, tests, context)
+
+              :per_module ->
+                if max_failures_reached?(config),
+                  do: [],
+                  else: run_tests(config, tests, context)
+            end
 
           :ok = exit_setup_all(module_pid, module_ref)
           {test_module, [], finished_tests}
@@ -327,6 +353,67 @@ defmodule ExUnit.Runner do
         {:DOWN, ^ref, _, _, _} -> :ok
       end
     end)
+  end
+
+  defp run_async_tests(config, tests, context) do
+    module_process = self()
+
+    running =
+      Enum.reduce(tests, %{}, fn test, acc ->
+        {pid, ref} =
+          spawn_monitor(fn ->
+            # The test will spawn, and then wait until it's instructed to actually
+            # execute the test.
+            receive do
+              {:execute, ref} ->
+                case run_test(config, test, context) do
+                  {:ok, test} ->
+                    send(module_process, {ref, :test_finished, test})
+
+                  :max_failures_reached ->
+                    send(module_process, {ref, :max_failures_reached})
+                end
+            end
+          end)
+
+        # This will allow async_loop to know that this test is now waiting to be
+        # executed.
+        ExUnit.Server.add_running_test(ref, pid)
+
+        Map.put(acc, ref, pid)
+      end)
+
+    async_module_loop(running, [])
+  end
+
+  defp async_module_loop(running, finished_tests) when map_size(running) == 0 do
+    finished_tests
+  end
+
+  defp async_module_loop(running, finished_tests) do
+    receive do
+      {ref, :test_finished, test} when is_map_key(running, ref) ->
+        async_module_loop(Map.delete(running, ref), [test | finished_tests])
+
+      {ref, :max_failures_reached} ->
+        # TODO: Do we need to stop further tests from being started somehow?
+        # Maybe tell ExUnit.Server to remove the running_tests and then have
+        # the existing processes be killed. Note: because there may be tests
+        # running that were spawned by other processes, only ExUnit.Server can
+        # kill them all, but this does feel like mixing responsibilities between
+        # the server and the runner..
+        async_module_loop(Map.delete(running, ref), finished_tests)
+
+      {:DOWN, test_ref, :process, _, _} when is_map_key(running, test_ref) ->
+        # Unexpected error in the process spawned in run_async_tests, causing
+        # it to go down before we could receive any of the above messages.
+        # TODO: Does this need to signal that a test has failed somehow?
+        async_module_loop(Map.delete(running, test_ref), finished_tests)
+
+      {:DOWN, _, _, _, _} ->
+        # Expected after a test has finished.
+        async_module_loop(running, finished_tests)
+    end
   end
 
   defp exit_setup_all(pid, ref) do
