@@ -9,16 +9,8 @@ defmodule ExUnit.Server do
     GenServer.start_link(__MODULE__, :ok, name: @name)
   end
 
-  def add_async_module(name, async_type \\ :per_module)
-  # async: true is an alias for async: :per_module
-  def add_async_module(name, true), do: add_async_module(name, :per_module)
-
-  def add_async_module(name, async_type) when async_type in [:per_module, :per_test],
-    do: add({name, async_type}, :async)
-
+  def add_async_module(name), do: add(name, :async)
   def add_sync_module(name), do: add(name, :sync)
-
-  def add_running_test(ref, pid), do: add({ref, pid}, :running)
 
   defp add(name, type) do
     case GenServer.call(@name, {:add, name, type}, @timeout) do
@@ -42,10 +34,6 @@ defmodule ExUnit.Server do
     GenServer.call(@name, :take_sync_modules, @timeout)
   end
 
-  def take_running_tests(count) do
-    GenServer.call(@name, {:take_running_tests, count}, @timeout)
-  end
-
   ## Callbacks
 
   def init(:ok) do
@@ -53,21 +41,10 @@ defmodule ExUnit.Server do
       loaded: System.monotonic_time(),
       waiting: nil,
       async_modules: [],
-      sync_modules: [],
-      running_tests: []
+      sync_modules: []
     }
 
     {:ok, state}
-  end
-
-  def handle_call({:take_running_tests, count}, _from, state) do
-    {reply, tests} =
-      case Enum.split(state.running_tests, count) do
-        {[], tests} -> {nil, tests}
-        reply -> reply
-      end
-
-    {:reply, reply, %{state | running_tests: tests}}
   end
 
   # Called on demand until we are signaled all modules are loaded.
@@ -90,20 +67,15 @@ defmodule ExUnit.Server do
     {:reply, diff, take_modules(%{state | loaded: :done})}
   end
 
-  def handle_call({:add, {_, _} = name_and_type, :async}, _from, %{loaded: loaded} = state)
+  def handle_call({:add, name, :async}, _from, %{loaded: loaded} = state)
       when is_integer(loaded) do
-    state = update_in(state.async_modules, &[name_and_type | &1])
+    state = update_in(state.async_modules, &[name | &1])
     {:reply, :ok, take_modules(state)}
   end
 
   def handle_call({:add, name, :sync}, _from, %{loaded: loaded} = state)
       when is_integer(loaded) do
     state = update_in(state.sync_modules, &[name | &1])
-    {:reply, :ok, state}
-  end
-
-  def handle_call({:add, {_, _} = ref_and_pid, :running}, _from, state) do
-    state = update_in(state.running_tests, &[ref_and_pid | &1])
     {:reply, :ok, state}
   end
 
