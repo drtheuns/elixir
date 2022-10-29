@@ -211,7 +211,7 @@ defmodule ExUnit.Runner do
     end
   end
 
-  defp async_per_test_loop(config, spawner_ref, spawner_pid, running, async_once? \\ false) do
+  defp async_per_test_loop(config, running, async_once? \\ false) do
     available = config.max_cases - map_size(running)
 
     receive do
@@ -219,7 +219,7 @@ defmodule ExUnit.Runner do
         ref = Process.monitor(pid)
         running = Map.put(running, ref, pid)
         send(pid, :execute)
-        async_per_test_loop(config, spawner_ref, spawner_pid, running, true)
+        async_per_test_loop(config, running, true)
 
       :async_modules_finished ->
         sync_modules = ExUnit.Server.take_sync_modules()
@@ -235,7 +235,7 @@ defmodule ExUnit.Runner do
 
       {:DOWN, test_ref, _, _, _} when is_map_key(running, test_ref) ->
         running = Map.delete(running, test_ref)
-        async_per_test_loop(config, spawner_ref, spawner_pid, running, async_once?)
+        async_per_test_loop(config, running, async_once?)
     end
   end
 
@@ -424,12 +424,12 @@ defmodule ExUnit.Runner do
         receive do
           :execute ->
             case run_test(config, test, context) do
-              {:ok, test} -> test
-              :max_failures_reached -> nil
-            end
+              {:ok, test} ->
+                test
 
-          :cancel ->
-            nil
+              :max_failures_reached ->
+                nil
+            end
         end
       end)
     end)
