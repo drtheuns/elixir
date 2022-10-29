@@ -178,9 +178,9 @@ defmodule ExUnit.Runner do
     # Use two separate processes: one for spawning modules and another for
     # executing the actual tests (the current process).
     parent = self()
-    {ref, pid} = spawn_monitor(fn -> module_spawner_loop(config, parent) end)
+    spawn(fn -> module_spawner_loop(config, parent) end)
 
-    async_per_test_loop(config, ref, pid, %{})
+    async_per_test_loop(config, %{})
   end
 
   defp module_spawner_loop(config, parent, running \\ %{}) do
