@@ -43,7 +43,16 @@ defmodule ExUnit.Runner do
 
     start_time = System.monotonic_time()
     EM.suite_started(config.manager, opts)
-    async_stop_time = async_loop(config, %{}, false)
+
+    async_stop_time =
+      case config do
+        %{async_mode: :per_test} ->
+          run_async_per_test(config)
+
+        _ ->
+          async_loop(config, %{}, false)
+      end
+
     stop_time = System.monotonic_time()
 
     if max_failures_reached?(config) do
@@ -80,7 +89,8 @@ defmodule ExUnit.Runner do
       seed: opts[:seed],
       stats_pid: stats_pid,
       timeout: opts[:timeout],
-      trace: opts[:trace]
+      trace: opts[:trace],
+      async_mode: opts[:async_mode]
     }
   end
 
@@ -103,7 +113,7 @@ defmodule ExUnit.Runner do
 
       # Slots are available, start with async modules
       modules = ExUnit.Server.take_async_modules(available) ->
-        running = spawn_modules(config, modules, running)
+        running = spawn_modules(config, modules, running, :per_module)
         async_loop(config, running, true)
 
       true ->
@@ -119,7 +129,7 @@ defmodule ExUnit.Runner do
 
         # Run all sync modules directly
         for module <- sync_modules do
-          running = spawn_modules(config, [module], %{})
+          running = spawn_modules(config, [module], %{}, nil)
           running != %{} and wait_until_available(config, running)
         end
 
@@ -151,16 +161,81 @@ defmodule ExUnit.Runner do
     end
   end
 
-  defp spawn_modules(_config, [], running) do
+  defp spawn_modules(_config, [], running, _async_data) do
     running
   end
 
-  defp spawn_modules(config, [module | modules], running) do
+  defp spawn_modules(config, [module | modules], running, async_data) do
     if max_failures_reached?(config) do
       running
     else
-      {pid, ref} = spawn_monitor(fn -> run_module(config, module) end)
-      spawn_modules(config, modules, Map.put(running, ref, pid))
+      {pid, ref} = spawn_monitor(fn -> run_module(config, module, async_data) end)
+      spawn_modules(config, modules, Map.put(running, ref, pid), async_data)
+    end
+  end
+
+  defp run_async_per_test(config) do
+    # Use two separate processes: one for spawning modules and another for
+    # executing the actual tests (the current process).
+    parent = self()
+    {ref, pid} = spawn_monitor(fn -> module_spawner_loop(config, parent) end)
+
+    async_per_test_loop(config, ref, pid, %{})
+  end
+
+  defp module_spawner_loop(config, parent, running \\ %{}) do
+    available = config.max_cases - map_size(running)
+
+    cond do
+      available <= 0 ->
+        running = wait_until_available(config, running)
+        module_spawner_loop(config, parent, running)
+
+      modules = ExUnit.Server.take_async_modules(available) ->
+        running = spawn_modules(config, modules, running, {:per_test, parent})
+        module_spawner_loop(config, parent, running)
+
+      true ->
+        finish_module_spawner_loop(config, parent, running)
+    end
+  end
+
+  defp finish_module_spawner_loop(config, parent, running) do
+    case map_size(running) do
+      0 ->
+        send(parent, :async_modules_finished)
+
+      _ ->
+        running = wait_until_available(config, running)
+        finish_module_spawner_loop(config, parent, running)
+    end
+  end
+
+  defp async_per_test_loop(config, spawner_ref, spawner_pid, running, async_once? \\ false) do
+    available = config.max_cases - map_size(running)
+
+    receive do
+      {:test_ready, pid} when available > 0 ->
+        ref = Process.monitor(pid)
+        running = Map.put(running, ref, pid)
+        send(pid, :execute)
+        async_per_test_loop(config, spawner_ref, spawner_pid, running, true)
+
+      :async_modules_finished ->
+        sync_modules = ExUnit.Server.take_sync_modules()
+
+        async_stop_time = if async_once?, do: System.monotonic_time(), else: nil
+
+        for module <- sync_modules do
+          running = spawn_modules(config, [module], %{}, nil)
+          running != %{} and wait_until_available(config, running)
+        end
+
+        async_stop_time
+
+      {:DOWN, test_ref, _, _, _} when is_map_key(running, test_ref) ->
+        running = Map.delete(running, test_ref)
+        async_per_test_loop(config, spawner_ref, spawner_pid, running, async_once?)
     end
   end
 
@@ -211,7 +286,7 @@ defmodule ExUnit.Runner do
 
   ## Running modules
 
-  defp run_module(config, module) do
+  defp run_module(config, module, async_data) do
     test_module = module.__ex_unit__()
     EM.module_started(config.manager, test_module)
 
@@ -224,7 +299,8 @@ defmodule ExUnit.Runner do
       EM.test_finished(config.manager, excluded_or_skipped_test)
     end
 
-    {test_module, invalid_tests, finished_tests} = run_module(config, test_module, to_run_tests)
+    {test_module, invalid_tests, finished_tests} =
+      run_module(config, test_module, to_run_tests, async_data)
 
     pending_tests =
       case process_max_failures(config, test_module) do
@@ -271,18 +347,20 @@ defmodule ExUnit.Runner do
     test_ids == nil or MapSet.member?(test_ids, {test.module, test.name})
   end
 
-  defp run_module(_config, test_module, []) do
+  defp run_module(_config, test_module, [], _async_data) do
     {test_module, [], []}
   end
 
-  defp run_module(config, test_module, tests) do
+  defp run_module(config, test_module, tests, async_data) do
     {module_pid, module_ref} = run_setup_all(test_module, self())
 
     {test_module, invalid_tests, finished_tests} =
       receive do
         {^module_pid, :setup_all, {:ok, context}} ->
           finished_tests =
-            if max_failures_reached?(config), do: [], else: run_tests(config, tests, context)
+            if max_failures_reached?(config),
+              do: [],
+              else: run_tests(config, tests, context, async_data)
 
           :ok = exit_setup_all(module_pid, module_ref)
           {test_module, [], finished_tests}
@@ -337,7 +415,29 @@ defmodule ExUnit.Runner do
     end
   end
 
-  defp run_tests(config, tests, context) do
+  defp run_tests(config, tests, context, {:per_test, runner_pid}) do
+    tests
+    |> Enum.map(fn test ->
+      Task.async(fn ->
+        send(runner_pid, {:test_ready, self()})
+
+        receive do
+          :execute ->
+            case run_test(config, test, context) do
+              {:ok, test} -> test
+              :max_failures_reached -> nil
+            end
+
+          :cancel ->
+            nil
+        end
+      end)
+    end)
+    |> Task.await_many(:infinity)
+    |> Enum.filter(&is_nil/1)
+  end
+
+  defp run_tests(config, tests, context, _) do
     Enum.reduce_while(tests, [], fn test, acc ->
       Process.put(@current_key, test)
 
