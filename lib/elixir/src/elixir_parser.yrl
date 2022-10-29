@@ -57,8 +57,11 @@ Expect 3.
 %% %{user | foo => bar} syntax.
 
 %% TODO: Assuming we change the typing syntax to use "or"
-%% instead "|", we should then change "::" to come after
-%% & and before = and have left associativity (for binaries).
+%% instead "|", we should then change "::" to come after =>.
+%% We may also want to consider addressing the precedence of
+%% [foo: bar | baz], but that may be a breaking change for
+%% custom DSLs. We should also consider removing support for
+%% keywords after when (therefore brackets will be required).
 
 Left       5 do.
 Right     10 stab_op_eol.     %% ->
